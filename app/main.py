@@ -1,8 +1,9 @@
-"""FastAPI 入口：审查、历史、引用展开树、报告下载、最小复现包导出。"""
+"""FastAPI 入口：审查、历史、引用展开树、根因聚合、报告下载、最小复现包导出。"""
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +11,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import database, reports, repro
+from . import database, groups, reports, repro
 from .diff import run_diff, summarize
 from .parser import SpecParseError, load_spec
 from .refs import build_ref_tree, expand_path_to_pointer, list_root_pointers
@@ -32,6 +33,12 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup() -> None:
     database.init_db()
+
+
+@app.get("/api/health")
+def health() -> dict[str, str]:
+    """轻量健康检查（Docker HEALTHCHECK 与容器编排探活使用）。"""
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------- #
@@ -116,6 +123,19 @@ def remove_review(review_id: int) -> Response:
 
 
 # ---------------------------------------------------------------------- #
+# 根因聚合（有向影响组）
+# ---------------------------------------------------------------------- #
+@app.get("/api/reviews/{review_id}/groups")
+def get_review_groups(review_id: int) -> dict[str, Any]:
+    review = database.get_review(review_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+    result = groups.build_impact_groups(review["findings"])
+    result["review_id"] = review_id
+    return result
+
+
+# ---------------------------------------------------------------------- #
 # 引用展开树
 # ---------------------------------------------------------------------- #
 @app.get("/api/reviews/{review_id}/pointers")
@@ -164,28 +184,29 @@ def download_report(review_id: int, format: str = "markdown") -> Response:
     safe_title = (review.get("title") or f"review-{review_id}")
     safe_title = "".join(c for c in safe_title if c.isalnum() or c in ("-", "_", " ", "."))
     safe_title = safe_title.strip().replace(" ", "_") or f"review-{review_id}"
+    # HTTP 头仅支持 latin-1：ASCII 回退名 + RFC 5987 UTF-8 文件名（中文标题兼容）
+    ascii_title = "".join(c for c in safe_title if c.isascii()) or f"review-{review_id}"
+
+    def _disposition(ext: str) -> str:
+        utf8_name = quote(f"openapi-review-{review_id}-{safe_title}.{ext}")
+        return (
+            f'attachment; filename="openapi-review-{review_id}-{ascii_title}.{ext}"; '
+            f"filename*=UTF-8''{utf8_name}"
+        )
 
     if format == "json":
         body = reports.build_json(review)
         return Response(
             content=body,
             media_type="application/json; charset=utf-8",
-            headers={
-                "Content-Disposition": (
-                    f'attachment; filename="openapi-review-{review_id}-{safe_title}.json"'
-                )
-            },
+            headers={"Content-Disposition": _disposition("json")},
         )
 
     body = reports.build_markdown(review)
     return Response(
         content=body,
         media_type="text/markdown; charset=utf-8",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="openapi-review-{review_id}-{safe_title}.md"'
-            )
-        },
+        headers={"Content-Disposition": _disposition("md")},
     )
 
 

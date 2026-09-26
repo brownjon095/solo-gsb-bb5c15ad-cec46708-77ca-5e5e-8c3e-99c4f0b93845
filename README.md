@@ -1,6 +1,6 @@
 # 🔎 OpenAPI 版本兼容性审查工具
 
-对比新旧两份 **OpenAPI 3.x**（JSON / YAML）文档，递归解析 `$ref`（**支持循环引用**）、合并 `allOf`，按**请求 / 响应两个方向**的语义规则判断每一处变更是否向后兼容，精确定位破坏性变更的 JSON 路径并给出原因。支持结果筛选、引用展开树浏览、审查报告下载、**单条发现的最小复现包导出**与历史记录。
+对比新旧两份 **OpenAPI 3.x**（JSON / YAML）文档，递归解析 `$ref`（**支持循环引用**）、合并 `allOf`，按**请求 / 响应两个方向**的语义规则判断每一处变更是否向后兼容，精确定位破坏性变更的 JSON 路径并给出原因。支持结果筛选、**根因聚合视图**（有向影响组）、引用展开树浏览、审查报告下载、**单条发现的最小复现包导出**与历史记录。
 
 技术栈：**FastAPI + SQLite + 原生 JavaScript**（前端零构建、零框架依赖）。
 
@@ -18,7 +18,7 @@ docker compose up -d --build
 
 > **http://localhost:8000**
 
-端口说明：容器内监听 `8000`，通过 `docker-compose.yml` 映射到宿主机 **8000**；审查数据保存在 Docker 卷 `review-data`（容器内 `/data/reviews.db`），重启不丢失。
+端口说明：容器内监听 `8000`，通过 `docker-compose.yml` 映射到宿主机 **8000**；审查数据保存在 Docker 卷 `review-data`（容器内 `/data/reviews.db`），重启不丢失。镜像内置 `HEALTHCHECK`，周期性探测 `GET /api/health`，可通过 `docker ps` 查看健康状态。
 
 停止 / 更新：
 
@@ -46,8 +46,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 3. 点击「开始审查 →」。
 4. 结果区提供：
    - 顶部统计卡片与总体结论（✅ 向后兼容 / ❌ N 项破坏性变更）；
+   - **逐条发现 / 根因聚合** 视图切换：聚合视图把同根因的发现折叠为有向影响组（详见下文「🧩 根因聚合视图」）；
    - **级别筛选**：🔴 破坏性 / 🟢 兼容 / 🟡 废弃提示 / ⚪ 信息；
-   - **方向筛选**（请求 / 响应 / 结构性）、**分类筛选**、关键字搜索；
+   - **方向筛选**（请求 / 响应 / 结构性）、**分类筛选**、关键字搜索（两种视图均生效）；
    - 每条发现可展开：人类可读定位、旧/新版 JSON Pointer、`$ref` 锚点、旧值 / 新值、规则编号；
    - 点击发现项上的 **🌲旧 / 🌲新** 按钮，右侧「引用展开树」自动切到对应版本并展开到该 `$ref`；
    - 每条发现可点击 **📦 导出最小复现包**，下载仅含该发现现场的最小文档对（ZIP，详见下文）；
@@ -99,6 +100,30 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 - `location`：载荷语义路径，如 `requestBody > application/json → 请求体.address.zip`
 - `old_json_path` / `new_json_path`：文档内 JSON Pointer（引用组件时锚点指向 `/components/schemas/...`），可直接用于在引用树中跳转。
+
+---
+
+## 🧩 根因聚合视图
+
+逐条发现列表在大型变更中容易"见树不见林"：一次类型整体替换会连带产生多条子字段删除，共享组件被多处引用时同一根因会以多条发现出现。详情页的「**根因聚合**」切换把发现折叠为**有向影响组**，每组一个主因。
+
+**分组规则**（服务端 `GET /api/reviews/{id}/groups` 实时计算，纯函数、无额外存储）：
+
+- **端点 × 方向是硬边界**：同一组件（含循环引用场景）在请求侧与响应侧**各自成组**，绝不跨方向合并；
+- **同源归并**：共享 / 循环组件被多处引用时，引擎可能对同一组件指针重复报告同一规则——`rule_id`、JSON Pointer 与 `$ref` 锚点完全一致的发现折叠为同一节点，多余条目记为 **同源**；
+- **祖先吸收**：父路径被**整体替换**（`type-changed`、schema 变为布尔等）或**整体删除**（`property-removed`、`response-removed` 等）时，其 JSON Pointer 后代发现只是下游影响，被父发现吸收，记为 **下游影响**（有向边 父 → 子，挂接最近祖先；`parameter-removed` 等容器级指针不参与吸收，避免误并同操作下其他参数的独立发现）。
+
+**每组返回**：
+
+| 字段 | 说明 |
+| --- | --- |
+| `group_id` | 稳定组标识：端点 / 方向 / 规则 / 锚点指针的 SHA-256 短哈希，同一审查重复查询结果一致 |
+| `primary` | 主因发现（完整字段，含 `relation: "primary"`） |
+| `affected` | 受影响条目（完整发现字段 + `relation`（`absorbed` / `same_cause`）、`depth`、`absorbed_by`） |
+| `locations` | 可展开定位：每个成员的语义路径 + 双侧 JSON Pointer + `$ref` 锚点 |
+| `severity` / `member_count` / `breaking_count` | 组级统计（严重度取组内最高） |
+
+聚合视图中主因与受影响条目均可展开定位、跳转引用树（🌲）并导出最小复现包（📦），与逐条视图能力一致；级别 / 方向 / 分类 / 关键字筛选同样生效。
 
 ---
 
@@ -158,17 +183,18 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI：审查 / 历史 / 引用树 / 报告下载接口
+│   ├── main.py        # FastAPI：审查 / 历史 / 引用树 / 根因聚合 / 报告下载 / 健康检查接口
 │   ├── parser.py      # JSON·YAML 载入与 OpenAPI 3.x 校验
 │   ├── refs.py        # JSON Pointer、$ref 解析、循环安全的引用展开树
 │   ├── diff.py        # 语义兼容性规则引擎（请求/响应双方向）
+│   ├── groups.py      # 根因聚合：端点×方向分区、同源归并、祖先吸收的有向影响组
 │   ├── repro.py       # 最小复现包：文档裁剪、$ref 闭包、复核与 ZIP 打包
 │   ├── reports.py     # Markdown / JSON 报告生成
 │   └── database.py    # SQLite 持久化（评审、原文、结果）
 ├── static/
 │   ├── index.html     # 单页界面
 │   ├── styles.css
-│   ├── app.js         # 原生 JS：筛选 / 展开树 / 历史 / 下载
+│   ├── app.js         # 原生 JS：筛选 / 聚合视图 / 展开树 / 历史 / 下载
 │   └── samples.js     # 四组内置示例（JSON + YAML）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -183,10 +209,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/reviews` | 历史审查列表 |
 | `GET` | `/api/reviews/{id}` | 审查详情（含全部 findings） |
 | `DELETE` | `/api/reviews/{id}` | 删除审查 |
+| `GET` | `/api/reviews/{id}/groups` | 根因聚合：有向影响组（稳定组标识 / 主因 / 受影响条目 / 可展开定位） |
 | `GET` | `/api/reviews/{id}/pointers` | 引用树根节点分组（paths / components） |
 | `GET` | `/api/reviews/{id}/tree?side=old|new&pointer=/...` | 引用展开树（含循环标记） |
 | `GET` | `/api/reviews/{id}/report?format=markdown|json` | 下载报告 |
 | `GET` | `/api/reviews/{id}/findings/{fid}/repro` | 导出单条发现的最小复现包（ZIP；复核失败返回 409 及可读原因） |
+| `GET` | `/api/health` | 健康检查（Docker HEALTHCHECK 与编排探活使用） |
 
 交互式文档：http://localhost:8000/docs （FastAPI 自动生成）。
 

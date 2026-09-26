@@ -445,6 +445,88 @@ input[type="search"] { min-width: 220px; }
 .repro-btn:disabled { opacity: 0.6; cursor: wait; }
 .repro-hint { font-size: 11px; color: var(--text-faint); }
 
+/* ---------------- 视图切换 / 根因聚合 ---------------- */
+.view-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.view-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.toggle-btn {
+  background: var(--bg-soft);
+  border: none;
+  color: var(--text-dim);
+  padding: 7px 16px;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-family: inherit;
+  transition: all .15s;
+}
+.toggle-btn + .toggle-btn { border-left: 1px solid var(--border); }
+.toggle-btn:hover { color: var(--text); }
+.toggle-btn.active { background: var(--accent-soft); color: var(--text); }
+.view-meta { color: var(--text-faint); font-size: 12px; }
+
+.group-size {
+  font-size: 11px;
+  color: var(--accent);
+  border: 1px solid rgba(79, 140, 255, .4);
+  border-radius: 999px;
+  padding: 1px 9px;
+  white-space: nowrap;
+}
+.group-id {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+.group-section {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  margin: 10px 0 6px;
+  letter-spacing: .5px;
+}
+.group-entry {
+  border: 1px solid var(--border-soft);
+  border-left-width: 3px;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  background: rgba(255, 255, 255, .015);
+}
+.group-entry.breaking { border-left-color: var(--breaking); }
+.group-entry.non_breaking { border-left-color: var(--ok); }
+.group-entry.deprecation { border-left-color: var(--warn); }
+.group-entry.info { border-left-color: var(--info); }
+.entry-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.entry-head .finding-msg { font-size: 12.5px; }
+.entry-body {
+  padding: 2px 12px 10px;
+  border-top: 1px dashed var(--border-soft);
+}
+.relation-tag {
+  font-size: 10.5px;
+  padding: 1px 8px;
+  border-radius: 4px;
+  flex: none;
+  white-space: nowrap;
+}
+.relation-tag.primary { background: var(--accent-soft); color: var(--accent); }
+.relation-tag.absorbed { background: var(--warn-soft); color: var(--warn); }
+.relation-tag.same_cause { background: var(--info-soft); color: var(--info); }
+
 .empty-hint {
   text-align: center;
   color: var(--text-faint);

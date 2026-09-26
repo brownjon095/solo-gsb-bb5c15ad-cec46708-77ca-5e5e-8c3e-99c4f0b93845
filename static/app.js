@@ -10,6 +10,10 @@
     filter: { severity: "all", direction: "all", category: "all", text: "" },
     tree: { side: "new", pointer: "", data: null, loading: false },
     expandedFinding: null,
+    view: "flat",          // flat=逐条发现 | groups=根因聚合
+    groups: null,          // 聚合结果缓存（按当前审查）
+    groupsMeta: null,
+    groupsPromise: null,   // 进行中的聚合请求（防重复拉取）
   };
 
   const SEV_LABEL = {
@@ -21,6 +25,12 @@
   const CHANGE_LABEL = { added: "新增", removed: "删除", changed: "修改" };
   const DIRECTION_LABEL = {
     request: "请求", response: "响应", shared: "请求/响应", none: "结构",
+  };
+  const REL_LABEL = { primary: "主因", absorbed: "下游影响", same_cause: "同源" };
+  const REL_TITLE = {
+    primary: "该影响组的根因发现",
+    absorbed: "父路径被整体替换/删除，该发现是其下游影响",
+    same_cause: "共享/循环组件在多处引用产生的同一根因",
   };
 
   // ------------------------------------------------------------------ //
@@ -75,6 +85,16 @@
   });
 
   $("#compare-btn").addEventListener("click", runCompare);
+
+  // 逐条发现 / 根因聚合 视图切换
+  $$("#view-toggle .toggle-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      $$("#view-toggle .toggle-btn").forEach((b) =>
+        b.classList.toggle("active", b === btn));
+      state.view = btn.dataset.view;
+      renderCurrentView();
+    });
+  });
 
   async function runCompare() {
     const oldSpec = $("#old-spec").value;
@@ -138,6 +158,14 @@
     const r = state.review;
     // 历史数据若没有引擎序号 id，按 1 起始位置补齐（与后端回退规则一致）
     (r.findings || []).forEach((f, i) => { if (f.id == null) f.id = i + 1; });
+    // 重置视图状态：默认逐条发现，聚合缓存随审查失效
+    state.view = "flat";
+    state.groups = null;
+    state.groupsMeta = null;
+    state.groupsPromise = null;
+    $$("#view-toggle .toggle-btn").forEach((b) =>
+      b.classList.toggle("active", b.dataset.view === "flat"));
+    $("#view-meta").textContent = "";
     $("#result-area").classList.remove("hidden");
     $("#result-title").textContent = r.title || `审查 #${r.id}`;
     $("#result-meta").textContent =
@@ -156,7 +184,7 @@
     populateCategoryFilter();
     bindFiltersOnce();
     syncFilterControls();
-    renderFindings();
+    renderCurrentView();
     loadPointers();
     loadTree();
   }
@@ -200,20 +228,20 @@
         $$("#severity-filters .chip").forEach((c) => c.classList.remove("active"));
         chip.classList.add("active");
         state.filter.severity = chip.dataset.severity;
-        renderFindings();
+        renderCurrentView();
       });
     });
     $("#direction-filter").addEventListener("change", (e) => {
       state.filter.direction = e.target.value;
-      renderFindings();
+      renderCurrentView();
     });
     $("#category-filter").addEventListener("change", (e) => {
       state.filter.category = e.target.value;
-      renderFindings();
+      renderCurrentView();
     });
     $("#text-filter").addEventListener("input", (e) => {
       state.filter.text = e.target.value.trim().toLowerCase();
-      renderFindings();
+      renderCurrentView();
     });
   }
 
@@ -243,9 +271,18 @@
     });
   }
 
+  function renderCurrentView() {
+    if (state.view === "groups") {
+      renderGroups();
+    } else {
+      renderFindings();
+    }
+  }
+
   function renderFindings() {
     const list = $("#findings-list");
     const items = filteredFindings();
+    $("#view-meta").textContent = "";
     $("#findings-empty").classList.toggle("hidden", items.length > 0);
 
     // 破坏性优先，其次按分类/定位排序
@@ -264,28 +301,30 @@
         if (e.target.closest(".mini-link, code")) return;
         card.querySelector(".finding-body").classList.toggle("hidden");
       });
-      const id = Number(card.dataset.id);
-      card.querySelectorAll("[data-tree-pointer]").forEach((el) => {
-        el.addEventListener("click", (e) => {
-          e.stopPropagation();
-          const pointer = el.dataset.treePointer;
-          if (!pointer) return;
-          jumpToRef(el.dataset.treeRef || null, el.dataset.treeSide, pointer);
-        });
+    });
+    bindFindingInteractions(list);
+  }
+
+  /** 绑定发现卡片内的交互：引用树跳转 + 最小复现包导出（两种视图共用）。 */
+  function bindFindingInteractions(root) {
+    root.querySelectorAll("[data-tree-pointer]").forEach((el) => {
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const pointer = el.dataset.treePointer;
+        if (!pointer) return;
+        jumpToRef(el.dataset.treeRef || null, el.dataset.treeSide, pointer);
       });
-      const reproBtn = card.querySelector("[data-repro]");
-      if (reproBtn) {
-        reproBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          downloadRepro(Number(reproBtn.dataset.repro), reproBtn);
-        });
-      }
+    });
+    root.querySelectorAll("[data-repro]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        downloadRepro(Number(btn.dataset.repro), btn);
+      });
     });
   }
 
-  function findingCard(f) {
-    const bodyHidden = state.expandedFinding === f.id ? "" : "hidden";
-    const refBtns = [
+  function refButtons(f) {
+    return [
       f.old_ref ? `<button class="mini-link" title="在旧版引用树中查看"
           data-tree-ref="${escapeAttr(f.old_ref)}" data-tree-side="old"
           data-tree-pointer="${escapeAttr(f.old_ref)}">🌲旧</button>` : "",
@@ -293,12 +332,38 @@
           data-tree-ref="${escapeAttr(f.new_ref)}" data-tree-side="new"
           data-tree-pointer="${escapeAttr(f.new_ref)}">🌲新</button>` : "",
     ].join("");
+  }
 
+  /** 发现详情体：定位 / 双侧指针 / 旧新值 / 规则 / 复现导出（两种视图共用）。 */
+  function findingBodyHtml(f) {
     const hasValues = f.old_value !== null || f.new_value !== null;
     const oldVal = hasValues
       ? `<div class="value-box"><div class="vb-label">旧值</div><pre>${escapeHtml(pretty(f.old_value))}</pre></div>` : "";
     const newVal = hasValues
       ? `<div class="value-box"><div class="vb-label">新值</div><pre>${escapeHtml(pretty(f.new_value))}</pre></div>` : "";
+    return `
+      <div class="loc-line">📍 ${escapeHtml(f.location)}</div>
+      <div class="path-rows">
+        <span class="k">旧路径</span>
+        <code data-tree-side="old" data-tree-pointer="${escapeAttr(f.old_json_path || "")}"
+          ${f.old_ref ? `data-tree-ref="${escapeAttr(f.old_ref)}"` : ""}>
+          ${escapeHtml(f.old_json_path || "—（新版新增）")}</code>
+        <span class="k">新路径</span>
+        <code data-tree-side="new" data-tree-pointer="${escapeAttr(f.new_json_path || "")}"
+          ${f.new_ref ? `data-tree-ref="${escapeAttr(f.new_ref)}"` : ""}>
+          ${escapeHtml(f.new_json_path || "—（旧版删除）")}</code>
+      </div>
+      ${hasValues ? `<div class="value-diff">${oldVal}${newVal}</div>` : ""}
+      <div class="rule-id">rule: ${escapeHtml(f.rule_id)} · 方向：${DIRECTION_LABEL[f.direction] || f.direction} · 分类：${escapeHtml(f.category)}</div>
+      <div class="repro-row">
+        <button class="mini-link repro-btn" data-repro="${f.id}"
+          title="裁剪新旧文档，仅保留该发现所属路径/操作及其传递引用的组件，打包 ZIP 下载">📦 导出最小复现包</button>
+        <span class="repro-hint">含 old.yaml / new.yaml / manifest.json，导出前会自动复核可复现性</span>
+      </div>`;
+  }
+
+  function findingCard(f) {
+    const bodyHidden = state.expandedFinding === f.id ? "" : "hidden";
 
     return `
     <article class="finding ${f.severity}" data-id="${f.id}">
@@ -308,30 +373,131 @@
         <p class="finding-msg">${escapeHtml(f.message)}</p>
         <span class="finding-meta">
           <span class="change-tag">${CHANGE_LABEL[f.change] || f.change}</span>
-          ${refBtns}
+          ${refButtons(f)}
         </span>
       </div>
       <div class="finding-body ${bodyHidden}">
-        <div class="loc-line">📍 ${escapeHtml(f.location)}</div>
-        <div class="path-rows">
-          <span class="k">旧路径</span>
-          <code data-tree-side="old" data-tree-pointer="${escapeAttr(f.old_json_path || "")}"
-            ${f.old_ref ? `data-tree-ref="${escapeAttr(f.old_ref)}"` : ""}>
-            ${escapeHtml(f.old_json_path || "—（新版新增）")}</code>
-          <span class="k">新路径</span>
-          <code data-tree-side="new" data-tree-pointer="${escapeAttr(f.new_json_path || "")}"
-            ${f.new_ref ? `data-tree-ref="${escapeAttr(f.new_ref)}"` : ""}>
-            ${escapeHtml(f.new_json_path || "—（旧版删除）")}</code>
-        </div>
-        ${hasValues ? `<div class="value-diff">${oldVal}${newVal}</div>` : ""}
-        <div class="rule-id">rule: ${escapeHtml(f.rule_id)} · 方向：${DIRECTION_LABEL[f.direction] || f.direction} · 分类：${escapeHtml(f.category)}</div>
-        <div class="repro-row">
-          <button class="mini-link repro-btn" data-repro="${f.id}"
-            title="裁剪新旧文档，仅保留该发现所属路径/操作及其传递引用的组件，打包 ZIP 下载">📦 导出最小复现包</button>
-          <span class="repro-hint">含 old.yaml / new.yaml / manifest.json，导出前会自动复核可复现性</span>
-        </div>
+        ${findingBodyHtml(f)}
       </div>
     </article>`;
+  }
+
+  // ------------------------------------------------------------------ //
+  // 根因聚合视图
+  // ------------------------------------------------------------------ //
+  async function ensureGroups() {
+    if (state.groups) return;
+    if (!state.groupsPromise) {
+      const rid = state.review.id;
+      state.groupsPromise = fetch(`/api/reviews/${rid}/groups`)
+        .then(async (resp) => {
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const data = await resp.json();
+          // 审查已切换时丢弃迟到结果
+          if (state.review && state.review.id === rid) {
+            state.groups = data.groups || [];
+            state.groupsMeta = data;
+          }
+        })
+        .finally(() => { state.groupsPromise = null; });
+    }
+    await state.groupsPromise;
+  }
+
+  function filteredGroups() {
+    const f = state.filter;
+    return (state.groups || []).filter((g) => {
+      if (f.severity !== "all" && g.severity !== f.severity) return false;
+      if (f.direction !== "all" && g.direction !== f.direction) return false;
+      if (f.category !== "all" && g.category !== f.category) return false;
+      if (f.text) {
+        const hay = [
+          g.rule_id, g.category, g.endpoint, g.primary.message, g.primary.location,
+          ...g.affected.flatMap((a) => [a.message, a.location, a.rule_id]),
+        ].join(" ").toLowerCase();
+        if (!hay.includes(f.text)) return false;
+      }
+      return true;
+    });
+  }
+
+  async function renderGroups() {
+    const list = $("#findings-list");
+    if (!state.groups) {
+      list.innerHTML = '<div class="empty-hint">正在计算根因聚合…</div>';
+      $("#findings-empty").classList.add("hidden");
+      try {
+        await ensureGroups();
+      } catch (err) {
+        list.innerHTML = `<div class="empty-hint">聚合加载失败：${escapeHtml(err.message)}</div>`;
+        return;
+      }
+    }
+    const meta = state.groupsMeta || {};
+    $("#view-meta").textContent =
+      `共 ${meta.total_findings ?? 0} 条发现 → ${meta.group_count ?? 0} 个影响组` +
+      (meta.affected_count ? `（${meta.affected_count} 条为下游/同源影响）` : "");
+
+    const groups = filteredGroups();
+    $("#findings-empty").classList.toggle("hidden", groups.length > 0);
+    list.innerHTML = groups.map((g) => groupCard(g)).join("");
+
+    list.querySelectorAll(".group-head").forEach((head) => {
+      head.addEventListener("click", (e) => {
+        if (e.target.closest(".mini-link, code")) return;
+        head.parentElement.querySelector(":scope > .finding-body").classList.toggle("hidden");
+      });
+    });
+    list.querySelectorAll(".entry-head").forEach((head) => {
+      head.addEventListener("click", (e) => {
+        if (e.target.closest(".mini-link, code")) return;
+        const body = head.nextElementSibling;
+        if (body) body.classList.toggle("hidden");
+      });
+    });
+    bindFindingInteractions(list);
+  }
+
+  function groupCard(g) {
+    const p = g.primary;
+    return `
+    <article class="finding group ${g.severity}" data-gid="${escapeAttr(g.group_id)}">
+      <div class="finding-head group-head">
+        <span class="finding-badge">${SEV_LABEL[g.severity] || g.severity}</span>
+        ${g.endpoint ? `<span class="finding-endpoint">${escapeHtml(g.endpoint)}</span>` : ""}
+        <p class="finding-msg">${escapeHtml(p.message)}</p>
+        <span class="finding-meta">
+          <span class="group-size" title="组内发现总数（主因 + 受影响条目）">${g.member_count} 条</span>
+          <span class="change-tag">${CHANGE_LABEL[g.change] || g.change}</span>
+          <span class="group-id" title="稳定组标识">${escapeHtml(g.group_id)}</span>
+        </span>
+      </div>
+      <div class="finding-body hidden">
+        <div class="group-section">主因</div>
+        ${groupEntryHtml(p, true)}
+        ${g.affected.length ? `<div class="group-section">受影响条目（${g.affected.length}）</div>` : ""}
+        ${g.affected.map((e) => groupEntryHtml(e, false)).join("")}
+        <div class="rule-id">group: ${escapeHtml(g.group_id)} · rule: ${escapeHtml(g.rule_id)} · 方向：${DIRECTION_LABEL[g.direction] || g.direction} · 分类：${escapeHtml(g.category || "")}</div>
+      </div>
+    </article>`;
+  }
+
+  function groupEntryHtml(f, isPrimary) {
+    const rel = f.relation || (isPrimary ? "primary" : "absorbed");
+    const indent = !isPrimary && f.depth > 0
+      ? ` style="margin-left:${Math.min(f.depth, 4) * 14}px"` : "";
+    return `
+    <div class="group-entry ${f.severity}"${indent}>
+      <div class="entry-head">
+        <span class="relation-tag ${rel}" title="${escapeAttr(REL_TITLE[rel] || "")}">${REL_LABEL[rel] || rel}</span>
+        <span class="finding-badge">${SEV_LABEL[f.severity] || f.severity}</span>
+        <p class="finding-msg">${escapeHtml(f.message)}</p>
+        <span class="finding-meta">${refButtons(f)}</span>
+      </div>
+      <div class="entry-body ${isPrimary ? "" : "hidden"}">
+        ${findingBodyHtml(f)}
+      </div>
+    </div>`;
   }
 
   function pretty(v) {
