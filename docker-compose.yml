@@ -5,6 +5,9 @@ services:
     container_name: openapi-compat-review
     ports:
       - "8000:8000"
+    environment:
+      # SQLite 数据库路径（显式声明，默认即 Dockerfile 中的 /data/reviews.db）
+      REVIEW_DB: /data/reviews.db
     volumes:
       - review-data:/data
     restart: unless-stopped

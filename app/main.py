@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import database, reports, repro
+from . import aggregate, database, reports, repro
 from .diff import run_diff, summarize
 from .parser import SpecParseError, load_spec
 from .refs import build_ref_tree, expand_path_to_pointer, list_root_pointers
@@ -18,7 +18,7 @@ from .refs import build_ref_tree, expand_path_to_pointer, list_root_pointers
 app = FastAPI(
     title="OpenAPI 版本兼容性审查",
     description="解析新旧两份 OpenAPI 3.x 文档，按请求/响应语义规则定位破坏性变更。",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -113,6 +113,22 @@ def remove_review(review_id: int) -> Response:
     if not database.delete_review(review_id):
         raise HTTPException(status_code=404, detail="审查记录不存在")
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------- #
+# 差异根因聚合
+# ---------------------------------------------------------------------- #
+@app.get("/api/reviews/{review_id}/groups")
+def get_finding_groups(review_id: int) -> dict[str, Any]:
+    """按端点 / 方向 / JSON Pointer 祖先关系聚合的根因影响组。
+
+    分组在读取时由 findings 即时构建（不入库、不改写原发现），因此历史
+    审查也能直接获得聚合视图；循环引用与请求 / 响应方向在聚合器中天然隔离。
+    """
+    review = database.get_review(review_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+    return aggregate.aggregate_findings(review["findings"], review_id=review_id)
 
 
 # ---------------------------------------------------------------------- #

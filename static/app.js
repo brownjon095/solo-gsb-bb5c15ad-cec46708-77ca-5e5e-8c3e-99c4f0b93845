@@ -10,6 +10,9 @@
     filter: { severity: "all", direction: "all", category: "all", text: "" },
     tree: { side: "new", pointer: "", data: null, loading: false },
     expandedFinding: null,
+    view: "flat",          // flat=逐条视图 | grouped=根因聚合视图
+    groups: null,          // 根因聚合结果（懒加载，按审查缓存）
+    groupsError: "",
   };
 
   const SEV_LABEL = {
@@ -112,6 +115,9 @@
       }
       state.review = data;
       state.filter = { severity: "all", direction: "all", category: "all", text: "" };
+      state.groups = null;
+      state.groupsError = "";
+      state.view = "flat";
       renderResult();
     } catch (err) {
       showError(`请求失败：${err.message}`);
@@ -156,7 +162,8 @@
     populateCategoryFilter();
     bindFiltersOnce();
     syncFilterControls();
-    renderFindings();
+    syncViewSwitch();
+    renderView();
     loadPointers();
     loadTree();
   }
@@ -200,21 +207,65 @@
         $$("#severity-filters .chip").forEach((c) => c.classList.remove("active"));
         chip.classList.add("active");
         state.filter.severity = chip.dataset.severity;
-        renderFindings();
+        renderView();
       });
     });
     $("#direction-filter").addEventListener("change", (e) => {
       state.filter.direction = e.target.value;
-      renderFindings();
+      renderView();
     });
     $("#category-filter").addEventListener("change", (e) => {
       state.filter.category = e.target.value;
-      renderFindings();
+      renderView();
     });
     $("#text-filter").addEventListener("input", (e) => {
       state.filter.text = e.target.value.trim().toLowerCase();
-      renderFindings();
+      renderView();
     });
+  }
+
+  // ------------------------------------------------------------------ //
+  // 视图切换：逐条 / 根因聚合
+  // ------------------------------------------------------------------ //
+  $$("#view-switch .seg").forEach((seg) => {
+    seg.addEventListener("click", () => {
+      const view = seg.dataset.view;
+      if (state.view === view) return;
+      state.view = view;
+      syncViewSwitch();
+      renderView();
+      if (view === "grouped" && state.review && !state.groups && !state.groupsError) {
+        loadGroups();
+      }
+    });
+  });
+
+  function syncViewSwitch() {
+    $$("#view-switch .seg").forEach((s) =>
+      s.classList.toggle("active", s.dataset.view === state.view));
+  }
+
+  function renderView() {
+    if (state.view === "grouped") renderGroupsView();
+    else renderFindings();
+  }
+
+  async function loadGroups() {
+    if (!state.review) return;
+    $("#groups-loading").classList.remove("hidden");
+    try {
+      const resp = await fetch(`/api/reviews/${state.review.id}/groups`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      state.groups = await resp.json();
+      state.groupsError = "";
+    } catch (err) {
+      state.groups = null;
+      state.groupsError = `根因分组加载失败：${err.message}`;
+    } finally {
+      $("#groups-loading").classList.add("hidden");
+      // 加载期间用户可能已切回逐条视图，避免覆盖当前视图
+      if (state.view === "grouped") renderGroupsView();
+    }
   }
 
   function syncFilterControls() {
@@ -227,26 +278,14 @@
   }
 
   function filteredFindings() {
-    const f = state.filter;
-    return state.review.findings.filter((item) => {
-      if (f.severity !== "all" && item.severity !== f.severity) return false;
-      if (f.direction !== "all" && item.direction !== f.direction) return false;
-      if (f.category !== "all" && item.category !== f.category) return false;
-      if (f.text) {
-        const hay = [
-          item.message, item.location, item.endpoint,
-          item.rule_id, item.category,
-        ].join(" ").toLowerCase();
-        if (!hay.includes(f.text)) return false;
-      }
-      return true;
-    });
+    return state.review.findings.filter(matchesFilter);
   }
 
   function renderFindings() {
     const list = $("#findings-list");
     const items = filteredFindings();
     $("#findings-empty").classList.toggle("hidden", items.length > 0);
+    $("#groups-summary").textContent = "";
 
     // 破坏性优先，其次按分类/定位排序
     const order = { breaking: 0, deprecation: 1, non_breaking: 2, info: 3 };
@@ -257,14 +296,16 @@
     );
 
     list.innerHTML = items.map((f) => findingCard(f)).join("");
+    bindFindingCards(list);
+  }
 
+  function bindFindingCards(list) {
     list.querySelectorAll(".finding").forEach((card) => {
       const head = card.querySelector(".finding-head");
       head.addEventListener("click", (e) => {
         if (e.target.closest(".mini-link, code")) return;
         card.querySelector(".finding-body").classList.toggle("hidden");
       });
-      const id = Number(card.dataset.id);
       card.querySelectorAll("[data-tree-pointer]").forEach((el) => {
         el.addEventListener("click", (e) => {
           e.stopPropagation();
@@ -281,6 +322,130 @@
         });
       }
     });
+  }
+
+  // ------------------------------------------------------------------ //
+  // 根因聚合视图
+  // ------------------------------------------------------------------ //
+  const RELATION_LABEL = {
+    "ancestor-replaced": "祖先整体替换",
+    "ancestor-removed": "祖先整体删除",
+  };
+
+  function matchesFilter(item) {
+    const f = state.filter;
+    if (f.severity !== "all" && item.severity !== f.severity) return false;
+    if (f.direction !== "all" && item.direction !== f.direction) return false;
+    if (f.category !== "all" && item.category !== f.category) return false;
+    if (f.text) {
+      const hay = [
+        item.message, item.location, item.endpoint,
+        item.rule_id, item.category,
+      ].join(" ").toLowerCase();
+      if (!hay.includes(f.text)) return false;
+    }
+    return true;
+  }
+
+  function renderGroupsView() {
+    const list = $("#findings-list");
+    const summary = $("#groups-summary");
+
+    if (!state.groups) {
+      list.innerHTML = "";
+      $("#findings-empty").classList.add("hidden");
+      summary.textContent = state.groupsError ||
+        (state.review ? "" : "");
+      if (state.groupsError) {
+        list.innerHTML = `<div class="empty-hint">${escapeHtml(state.groupsError)}</div>`;
+      }
+      return;
+    }
+
+    const g = state.groups;
+    summary.textContent =
+      `${g.group_count} 个根因组 · 吸收 ${g.grouped_finding_count - g.group_count} 条连带发现 · ` +
+      `${g.ungrouped_count} 条独立发现（共 ${g.total} 条）`;
+
+    const parts = [];
+    for (const grp of g.groups) {
+      const rootHit = matchesFilter(grp.root_cause);
+      const anyAffectedHit = grp.affected.some((e) => matchesFilter(e.finding));
+      if (!rootHit && !anyAffectedHit) continue;
+      parts.push(groupCard(grp));
+    }
+    const standalone = g.standalone.filter(matchesFilter);
+    if (standalone.length && parts.length) {
+      parts.push(`<div class="affected-label" style="margin:14px 4px 8px">
+        以下为未被吸收的独立发现（${standalone.length} 条）</div>`);
+    }
+    parts.push(...standalone.map((f) => findingCard(f)));
+
+    list.innerHTML = parts.join("");
+    $("#findings-empty").classList.toggle("hidden", parts.length > 0);
+
+    // 组头折叠 + 组头 🌲 跳转 + 内部发现卡交互
+    list.querySelectorAll(".root-group").forEach((card) => {
+      card.querySelector(".root-head").addEventListener("click", (e) => {
+        if (e.target.closest(".mini-link, code")) return;
+        const box = card.querySelector(".group-body");
+        const nowHidden = box.classList.toggle("hidden");
+        card.querySelector(".root-toggle").textContent = nowHidden ? "▸" : "▾";
+      });
+      card.querySelectorAll(".root-head [data-tree-pointer]").forEach((el) => {
+        el.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const pointer = el.dataset.treePointer;
+          if (pointer) jumpToRef(el.dataset.treeRef || null, el.dataset.treeSide, pointer);
+        });
+      });
+    });
+    bindFindingCards(list);
+  }
+
+  function groupCard(grp) {
+    const root = grp.root_cause;
+    const sev = root.severity;
+    const relation = RELATION_LABEL[grp.relation] || grp.relation;
+    const refBtns = [
+      root.old_ref ? `<button class="mini-link" title="在旧版引用树中查看"
+          data-tree-ref="${escapeAttr(root.old_ref)}" data-tree-side="old"
+          data-tree-pointer="${escapeAttr(root.old_ref)}">🌲旧</button>` : "",
+      root.new_ref ? `<button class="mini-link" title="在新版引用树中查看"
+          data-tree-ref="${escapeAttr(root.new_ref)}" data-tree-side="new"
+          data-tree-pointer="${escapeAttr(root.new_ref)}">🌲新</button>` : "",
+    ].join("");
+
+    const affectedRows = grp.affected.map((e) => {
+      const hit = matchesFilter(e.finding);
+      return `<div class="affected-item${hit ? "" : " dimmed"}"
+          style="margin-left:${Math.min(e.depth - 1, 4) * 18}px">
+        ${findingCard(e.finding)}
+      </div>`;
+    }).join("");
+
+    return `
+    <section class="root-group ${sev}" data-group="${escapeAttr(grp.group_id)}">
+      <div class="root-head">
+        <span class="root-toggle">▾</span>
+        <span class="root-label">主因 · ${relation}</span>
+        ${grp.endpoint ? `<span class="finding-endpoint">${escapeHtml(grp.endpoint)}</span>` : ""}
+        <span class="root-sub-inline">${escapeHtml(root.rule_id)} ·
+          方向 ${escapeHtml(DIRECTION_LABEL[grp.direction] || grp.direction)}</span>
+        <span class="root-meta">
+          <span class="affected-count" title="被该主因吸收的连带发现数">吸收 ${grp.affected_count}</span>
+          ${refBtns}
+        </span>
+      </div>
+      <div class="group-body">
+        <div class="affected-label">主因（展开卡片查看 JSON Pointer 定位与最小复现包）</div>
+        ${findingCard(root)}
+        <div class="affected-box">
+          <div class="affected-label">受影响的连带发现（${grp.affected_count} 条；灰色项不满足当前筛选）</div>
+          ${affectedRows}
+        </div>
+      </div>
+    </section>`;
   }
 
   function findingCard(f) {
@@ -622,6 +787,9 @@
           const review = await (await fetch(`/api/reviews/${b.dataset.open}`)).json();
           state.review = review;
           state.filter = { severity: "all", direction: "all", category: "all", text: "" };
+          state.groups = null;
+          state.groupsError = "";
+          state.view = "flat";
           $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === "review"));
           $$(".tab-panel").forEach((p) =>
             p.classList.toggle("active", p.id === "tab-review"));

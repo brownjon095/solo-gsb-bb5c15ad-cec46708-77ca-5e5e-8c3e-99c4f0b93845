@@ -112,6 +112,12 @@
 
         <div class="content-columns">
           <div class="findings-col">
+            <div class="view-switch" id="view-switch">
+              <button class="seg active" data-view="flat">逐条视图</button>
+              <button class="seg" data-view="grouped">根因聚合视图</button>
+              <span id="groups-summary" class="groups-summary"></span>
+            </div>
+            <div id="groups-loading" class="inline-loading hidden">根因分组加载中…</div>
             <div id="findings-list"></div>
             <div id="findings-empty" class="empty-hint hidden">没有符合筛选条件的变更。</div>
           </div>
